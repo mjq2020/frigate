@@ -94,6 +94,16 @@ class HailoDetector(DetectionApi):
             self.input_vstream_info = self.hef.get_input_vstream_infos()
             self.output_vstream_info = self.hef.get_output_vstream_infos()
 
+            self.infer = InferVStreams(
+                self.network_group,
+                self.input_vstream_params,
+                self.output_vstream_params,
+            )
+
+            self.activater = self.network_group.activate(self.network_group_params)
+
+            self.__enter__()
+
             logger.info("Hailo device initialized successfully")
             logger.debug(f"[__init__] Model Path: {self.h8l_model_path}")
             logger.debug(f"[__init__] Input Tensor Format: {self.h8l_tensor_format}")
@@ -108,6 +118,20 @@ class HailoDetector(DetectionApi):
         except Exception as e:
             logger.error(f"Failed to initialize Hailo device: {e}")
             raise
+
+    def __enter__(self):
+        logger.debug("[__enter__] Entering function")
+        self.infer_ctx = self.infer.__enter__()
+        self.activater.__enter__()
+        return self.infer_ctx
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Release the inference context
+        self.infer_ctx.__exit__(exc_type, exc_val, exc_tb)
+        # Release the activator context
+        self.activater.__exit__(exc_type, exc_val, exc_tb)
+        # Indicate that exceptions should be propagated up the stack
+        return False
 
     def check_and_prepare_model(self):
         # Ensure cache directory exists
@@ -151,43 +175,37 @@ class HailoDetector(DetectionApi):
         )
 
         try:
-            with InferVStreams(
-                self.network_group,
-                self.input_vstream_params,
-                self.output_vstream_params,
-            ) as infer_pipeline:
-                input_dict = {}
-                if isinstance(input_data, dict):
-                    input_dict = input_data
-                    logger.debug("[detect_raw] it a dictionary.")
-                elif isinstance(input_data, (list, tuple)):
-                    for idx, layer_info in enumerate(self.input_vstream_info):
-                        input_dict[layer_info.name] = input_data[idx]
-                        logger.debug("[detect_raw] converted from list/tuple.")
-                else:
-                    if len(input_data.shape) == 3:
-                        input_data = np.expand_dims(input_data, axis=0)
-                        logger.debug("[detect_raw] converted from an array.")
-                    input_dict[self.input_vstream_info[0].name] = input_data
+            input_dict = {}
+            if isinstance(input_data, dict):
+                input_dict = input_data
+                logger.debug("[detect_raw] it a dictionary.")
+            elif isinstance(input_data, (list, tuple)):
+                for idx, layer_info in enumerate(self.input_vstream_info):
+                    input_dict[layer_info.name] = input_data[idx]
+                    logger.debug("[detect_raw] converted from list/tuple.")
+            else:
+                if len(input_data.shape) == 3:
+                    input_data = np.expand_dims(input_data, axis=0)
+                    logger.debug("[detect_raw] converted from an array.")
+                input_dict[self.input_vstream_info[0].name] = input_data
 
-                logger.debug(
-                    f"[detect_raw] Input dictionary for inference keys: {input_dict.keys()}"
+            logger.debug(
+                f"[detect_raw] Input dictionary for inference keys: {input_dict.keys()}"
+            )
+            # inference
+            raw_output = self.infer_ctx.infer(input_dict)
+            logger.debug(f"[detect_raw] Raw inference output: {raw_output}")
+
+            if self.output_vstream_info[0].name not in raw_output:
+                logger.error(
+                    f"[detect_raw] Missing output stream {self.output_vstream_info[0].name} in inference results"
                 )
+                return np.zeros((20, 6), np.float32)
 
-                with self.network_group.activate(self.network_group_params):
-                    raw_output = infer_pipeline.infer(input_dict)
-                    logger.debug(f"[detect_raw] Raw inference output: {raw_output}")
-
-                    if self.output_vstream_info[0].name not in raw_output:
-                        logger.error(
-                            f"[detect_raw] Missing output stream {self.output_vstream_info[0].name} in inference results"
-                        )
-                        return np.zeros((20, 6), np.float32)
-
-                    raw_output = raw_output[self.output_vstream_info[0].name][0]
-                    logger.debug(
-                        f"[detect_raw] Raw output for stream {self.output_vstream_info[0].name}: {raw_output}"
-                    )
+            raw_output = raw_output[self.output_vstream_info[0].name][0]
+            logger.debug(
+                f"[detect_raw] Raw output for stream {self.output_vstream_info[0].name}: {raw_output}"
+            )
 
             # Process the raw output
             detections = self.process_detections(raw_output)
