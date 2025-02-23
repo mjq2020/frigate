@@ -7,7 +7,9 @@ import signal
 import subprocess as sp
 import threading
 import time
+from typing import List
 
+import numpy as np
 import cv2
 from setproctitle import setproctitle
 
@@ -47,6 +49,7 @@ from frigate.util.object import (
     reduce_detections,
 )
 from frigate.util.services import listen
+from frigate.buffer_manager import MultiCameraBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +418,7 @@ def track_camera(
     camera_metrics: CameraMetrics,
     ptz_metrics: PTZMetrics,
     region_grid,
+    camerabuffer: MultiCameraBuffer,
 ):
     stop_event = mp.Event()
 
@@ -438,7 +442,13 @@ def track_camera(
         frame_shape, config.motion, config.detect.fps, name=config.name
     )
     object_detector = RemoteObjectDetector(
-        name, labelmap, detection_queue, result_connection, model_config, stop_event
+        name,
+        labelmap,
+        detection_queue,
+        result_connection,
+        model_config,
+        stop_event,
+        camerabuffer,
     )
 
     object_tracker = NorfairTracker(config, ptz_metrics)
@@ -482,43 +492,57 @@ def detect(
     object_detector,
     frame,
     model_config,
-    region,
+    regions: List[List[int]],
     objects_to_track,
     object_filters,
 ):
-    tensor_input = create_tensor_input(frame, model_config, region)
+    if not len(regions):
+        return []
+    input_tensor_ls = []
+    for region in regions:
+        tensor_input = create_tensor_input(frame, model_config, region)
+        input_tensor_ls.append(tensor_input)
 
-    detections = []
-    region_detections = object_detector.detect(tensor_input)
-    for d in region_detections:
-        box = d[2]
-        size = region[2] - region[0]
-        x_min = int(max(0, (box[1] * size) + region[0]))
-        y_min = int(max(0, (box[0] * size) + region[1]))
-        x_max = int(min(detect_config.width - 1, (box[3] * size) + region[0]))
-        y_max = int(min(detect_config.height - 1, (box[2] * size) + region[1]))
+    regions_detections = object_detector.detect(np.concatenate(input_tensor_ls, 0))
+    detections_ls = []
+    for idx, region_detections in enumerate(regions_detections):
+        detections = []
 
-        # ignore objects that were detected outside the frame
-        if (x_min >= detect_config.width - 1) or (y_min >= detect_config.height - 1):
-            continue
+        for d in region_detections:
+            if idx >= len(regions):
+                break
+            region = d[3]
+            box = d[2]
+            size = region[2] - region[0]
+            x_min = int(max(0, (box[1] * size) + region[0]))
+            y_min = int(max(0, (box[0] * size) + region[1]))
+            x_max = int(min(detect_config.width - 1, (box[3] * size) + region[0]))
+            y_max = int(min(detect_config.height - 1, (box[2] * size) + region[1]))
 
-        width = x_max - x_min
-        height = y_max - y_min
-        area = width * height
-        ratio = width / max(1, height)
-        det = (
-            d[0],
-            d[1],
-            (x_min, y_min, x_max, y_max),
-            area,
-            ratio,
-            region,
-        )
-        # apply object filters
-        if is_object_filtered(det, objects_to_track, object_filters):
-            continue
-        detections.append(det)
-    return detections
+            # ignore objects that were detected outside the frame
+            if (x_min >= detect_config.width - 1) or (
+                y_min >= detect_config.height - 1
+            ):
+                continue
+
+            width = x_max - x_min
+            height = y_max - y_min
+            area = width * height
+            ratio = width / max(1, height)
+            det = (
+                d[0],
+                d[1],
+                (x_min, y_min, x_max, y_max),
+                area,
+                ratio,
+                region,
+            )
+            # apply object filters
+            if is_object_filtered(det, objects_to_track, object_filters):
+                continue
+            detections.append(det)
+        detections_ls.append(detections)
+    return detections_ls
 
 
 def process_frames(
@@ -695,19 +719,24 @@ def process_frames(
                 if obj["id"] in stationary_object_ids
             ]
 
-            for region in regions:
-                detections.extend(
-                    detect(
-                        detect_config,
-                        object_detector,
-                        frame,
-                        model_config,
-                        region,
-                        objects_to_track,
-                        object_filters,
-                    )
-                )
+            pre_frame = frame
+            # more batch tensor
+            for d in detect(
+                detect_config,
+                object_detector,
+                frame,
+                model_config,
+                regions[:4],
+                objects_to_track,
+                object_filters,
+            ):
+                detections.extend(d)
 
+            regions = (
+                [[int(i) for i in d[-1]] for d in detections]
+                if len(detections)
+                else regions
+            )
             consolidated_detections = reduce_detections(frame_shape, detections)
 
             # if detection was run on this frame, consolidate
@@ -828,7 +857,7 @@ def process_frames(
             )
         # add to the queue if not full
         if detected_objects_queue.full():
-            frame_manager.close(frame_name)
+            # frame_manager.close(frame_name)
             continue
         else:
             fps_tracker.update()
@@ -844,8 +873,7 @@ def process_frames(
                 )
             )
             camera_metrics.detection_fps.value = object_detector.fps.eps()
-            frame_manager.close(frame_name)
-
+            # frame_manager.close(frame_name)
     motion_detector.stop()
     requestor.stop()
     config_subscriber.stop()

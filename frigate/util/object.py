@@ -287,6 +287,7 @@ def create_tensor_input(frame, model_config: ModelConfig, region):
             interpolation=cv2.INTER_LINEAR,
         )
 
+    cropped_frame[0, :4, 0] = np.asarray(region) / 4
     # Expand dimensions since the model expects images to have shape: [1, height, width, 3]
     return np.expand_dims(cropped_frame, axis=0)
 
