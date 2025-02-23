@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 from abc import ABC, abstractmethod
+import time
 
 import numpy as np
 from setproctitle import setproctitle
@@ -21,6 +22,7 @@ from frigate.detectors.plugins.rocm import DETECTOR_KEY as ROCM_DETECTOR_KEY
 from frigate.util.builtin import EventsPerSecond, load_labels
 from frigate.util.image import SharedMemoryFrameManager, UntrackedSharedMemory
 from frigate.util.services import listen
+from frigate.buffer_manager import MultiCameraBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -84,13 +86,15 @@ class LocalObjectDetector(ObjectDetector):
         self.fps.update()
         return detections
 
-    def detect_raw(self, tensor_input: np.ndarray):
+    def detect_raw(self, tensor_input: dict[str,np.ndarray]):
         if self.input_transform:
-            tensor_input = np.transpose(tensor_input, self.input_transform)
+            for k,v in tensor_input.items():
+                tensor_input[k] = np.transpose(v, self.input_transform)
 
         if self.dtype == InputDTypeEnum.float:
-            tensor_input = tensor_input.astype(np.float32)
-            tensor_input /= 255
+            for k,v in tensor_input.items():
+                tensor_input[k] = v.astype(np.float32)
+                tensor_input[k] /= 255
 
         return self.detect_api.detect_raw(tensor_input=tensor_input)
 
@@ -102,6 +106,7 @@ def run_detector(
     avg_speed,
     start,
     detector_config,
+    carmerabuffer:MultiCameraBuffer
 ):
     threading.current_thread().name = f"detector:{name}"
     logger = logging.getLogger(f"detector.{name}")
@@ -127,26 +132,20 @@ def run_detector(
         outputs[name] = {"shm": out_shm, "np": out_np}
 
     while not stop_event.is_set():
-        try:
-            connection_id = detection_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-        input_frame = frame_manager.get(
-            connection_id,
-            (1, detector_config.model.height, detector_config.model.width, 3),
-        )
-
-        if input_frame is None:
-            logger.warning(f"Failed to get frame {connection_id} from SHM")
+        input_tensor_dict = carmerabuffer.read_frames()
+        
+        if not input_tensor_dict:
+            time.sleep(0.06)
             continue
 
         # detect and send the output
         start.value = datetime.datetime.now().timestamp()
-        detections = object_detector.detect_raw(input_frame)
+
+        detections = object_detector.detect_raw(input_tensor_dict)
+
         duration = datetime.datetime.now().timestamp() - start.value
-        frame_manager.close(connection_id)
-        outputs[connection_id]["np"][:] = detections[:]
-        out_events[connection_id].set()
+        for k,v in detections.items():
+            carmerabuffer.write_results(k,v)
         start.value = 0.0
 
         avg_speed.value = (avg_speed.value * 9 + duration) / 10
@@ -161,6 +160,8 @@ class ObjectDetectProcess:
         detection_queue,
         out_events,
         detector_config,
+        config,
+        camerabuffer
     ):
         self.name = name
         self.out_events = out_events
@@ -169,6 +170,8 @@ class ObjectDetectProcess:
         self.detection_start = mp.Value("d", 0.0)
         self.detect_process = None
         self.detector_config = detector_config
+        self.config =config
+        self.camerabuffer = camerabuffer
         self.start_or_restart()
 
     def stop(self):
@@ -198,6 +201,7 @@ class ObjectDetectProcess:
                 self.avg_inference_speed,
                 self.detection_start,
                 self.detector_config,
+                self.camerabuffer
             ),
         )
         self.detect_process.daemon = True
@@ -205,7 +209,7 @@ class ObjectDetectProcess:
 
 
 class RemoteObjectDetector:
-    def __init__(self, name, labels, detection_queue, event, model_config, stop_event):
+    def __init__(self, name, labels, detection_queue, event, model_config, stop_event,camerabuffer:MultiCameraBuffer):
         self.labels = labels
         self.name = name
         self.fps = EventsPerSecond()
@@ -220,31 +224,41 @@ class RemoteObjectDetector:
         )
         self.out_shm = UntrackedSharedMemory(name=f"out-{self.name}", create=False)
         self.out_np_shm = np.ndarray((20, 6), dtype=np.float32, buffer=self.out_shm.buf)
+        
+        self.camerabuffer = camerabuffer
+        self.detect_pre=[]
 
     def detect(self, tensor_input, threshold=0.4):
-        detections = []
+        '''
+        tensor_input: shape(B,H,W,3)
+        '''
 
         if self.stop_event.is_set():
             return detections
+        
+        self.camerabuffer.write_frame(self.name,tensor_input)
+        
+        while True:
+            result = self.camerabuffer.read_results(self.name)
+            detections_ls = []
+            if not isinstance(result,bool):
+                for idx,batch in enumerate(result):
+                    detections = []
+                    for d in batch:
+                        if np.isnan(d[0]):
+                            continue
+                        if d[1] < threshold:
+                            break
+                        detections.append(
+                            (self.labels[int(d[0])], float(d[1]), (d[2], d[3], d[4], d[5]),(int(d[6])*4,int(d[7])*4,int(d[8])*4,int(d[9])*4))
+                        )
 
-        # copy input to shared memory
-        self.np_shm[:] = tensor_input[:]
-        self.event.clear()
-        self.detection_queue.put(self.name)
-        result = self.event.wait(timeout=5.0)
-
-        # if it timed out
-        if result is None:
-            return detections
-
-        for d in self.out_np_shm:
-            if d[1] < threshold:
+                    detections_ls.append(detections)
                 break
-            detections.append(
-                (self.labels[int(d[0])], float(d[1]), (d[2], d[3], d[4], d[5]))
-            )
+            time.sleep(0.02)
         self.fps.update()
-        return detections
+
+        return detections_ls
 
     def cleanup(self):
         self.shm.unlink()
