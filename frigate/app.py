@@ -74,6 +74,7 @@ from frigate.util.object import get_camera_regions_grid
 from frigate.version import VERSION
 from frigate.video import capture_camera, track_camera
 from frigate.watchdog import FrigateWatchdog
+from frigate.buffer_manager import MultiCameraBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +316,13 @@ class FrigateApp:
             comms,
         )
 
+    def init_frame_buffer(self):
+        camera_ids = []
+        for name in self.config.cameras.keys():
+            camera_ids.append(name)
+
+        self.camerabuffer = MultiCameraBuffer(camera_ids, 300, 300, frame_buffer_size=3)
+
     def start_detectors(self) -> None:
         for name in self.config.cameras.keys():
             self.detection_out_events[name] = mp.Event()
@@ -322,9 +330,11 @@ class FrigateApp:
             try:
                 largest_frame = max(
                     [
-                        det.model.height * det.model.width * 3
-                        if det.model is not None
-                        else 320
+                        (
+                            det.model.height * det.model.width * 3
+                            if det.model is not None
+                            else 320
+                        )
                         for det in self.config.detectors.values()
                     ]
                 )
@@ -352,6 +362,8 @@ class FrigateApp:
                 self.detection_queue,
                 self.detection_out_events,
                 detector_config,
+                self.config,
+                self.camerabuffer,
             )
 
     def start_ptz_autotracker(self) -> None:
@@ -419,6 +431,7 @@ class FrigateApp:
                     self.camera_metrics[name],
                     self.ptz_metrics[name],
                     self.region_grids[name],
+                    self.camerabuffer,
                 ),
                 daemon=True,
             )
@@ -595,6 +608,7 @@ class FrigateApp:
         self.init_recording_manager()
         self.init_review_segment_manager()
         self.init_go2rtc()
+        self.init_frame_buffer()
         self.start_detectors()
         self.init_embeddings_manager()
         self.bind_database()
@@ -657,6 +671,9 @@ class FrigateApp:
         if self.audio_process:
             self.audio_process.terminate()
             self.audio_process.join()
+
+        # cleanup
+        self.camerabuffer.cleanup()
 
         # ensure the capture processes are done
         for camera, metrics in self.camera_metrics.items():
