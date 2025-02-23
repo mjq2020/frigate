@@ -151,11 +151,11 @@ class HailoDetector(DetectionApi):
                 f"A model file already exists at {model_file_path} not downloading one."
             )
 
-    def detect_raw(self, tensor_input):
+    def detect_raw(self, tensor_input:dict[str,np.ndarray]):
         logger.debug("[detect_raw] Entering function")
-        logger.debug(
-            f"[detect_raw] The `tensor_input` = {tensor_input} tensor_input shape = {tensor_input.shape}"
-        )
+        # logger.debug(
+        #     f"[detect_raw] The `tensor_input` = {tensor_input} tensor_input shape = {tensor_input.shape}"
+        # )
 
         if tensor_input is None:
             raise ValueError(
@@ -170,14 +170,22 @@ class HailoDetector(DetectionApi):
             )
 
         input_data = tensor_input
-        logger.debug(
-            f"[detect_raw] Input data for inference shape: {tensor_input.shape}, dtype: {tensor_input.dtype}"
-        )
-
+        # logger.debug(
+        #     f"[detect_raw] Input data for inference shape: {tensor_input.shape}, dtype: {tensor_input.dtype}"
+        # )
+        input_keys = []
+        self.input_regions = []
         try:
             input_dict = {}
             if isinstance(input_data, dict):
-                input_dict = input_data
+                input_tmp=[]
+                for k,v in input_data.items():
+                    input_keys.append(k)
+                    input_tmp.append(v)
+                    for vs in v:
+                        self.input_regions.append(list(vs[0,:4,0]))
+                
+                input_dict[self.input_vstream_info[0].name] = np.concatenate(input_tmp,axis=0)
                 logger.debug("[detect_raw] it a dictionary.")
             elif isinstance(input_data, (list, tuple)):
                 for idx, layer_info in enumerate(self.input_vstream_info):
@@ -213,91 +221,97 @@ class HailoDetector(DetectionApi):
                 logger.debug(
                     "[detect_raw] No detections found after processing. Setting default values."
                 )
-                return np.zeros((20, 6), np.float32)
+                return np.zeros((detections.shape[0], 20, 6), np.float32)
             else:
                 formatted_detections = detections
                 if (
-                    formatted_detections.shape[1] != 6
+                    formatted_detections.shape[1] != 10
                 ):  # Ensure the formatted detections have 6 columns
                     logger.error(
                         f"[detect_raw] Unexpected shape for formatted detections: {formatted_detections.shape}. Expected (20, 6)."
                     )
-                    return np.zeros((20, 6), np.float32)
+                    return np.zeros((detections.shape[0], 20, 6), np.float32)
                 return formatted_detections
         except HailoRTException as e:
             logger.error(f"[detect_raw] HailoRTException during inference: {e}")
-            return np.zeros((20, 6), np.float32)
+            return np.zeros((detections.shape[0], 20, 6), np.float32)
         except Exception as e:
             logger.error(f"[detect_raw] Exception during inference: {e}")
-            return np.zeros((20, 6), np.float32)
+            return np.zeros((detections.shape[0], 20, 6), np.float32)
         finally:
             logger.debug("[detect_raw] Exiting function")
 
     def process_detections(self, raw_detections, threshold=0.5):
-        boxes, scores, classes = [], [], []
         num_detections = 0
 
         logger.debug(f"[process_detections] Raw detections: {raw_detections}")
-
-        for i, detection_set in enumerate(raw_detections):
-            if not isinstance(detection_set, np.ndarray) or detection_set.size == 0:
-                logger.debug(
-                    f"[process_detections] Detection set {i} is empty or not an array, skipping."
-                )
-                continue
-
-            logger.debug(
-                f"[process_detections] Detection set {i} shape: {detection_set.shape}"
-            )
-
-            for detection in detection_set:
-                if detection.shape[0] == 0:
+        # print("DETECT:")
+        batch_boxes,batch_scores,batch_classes=[],[],[]
+        for detections in raw_detections:
+            boxes, scores, classes = [], [], []
+            for i, detection_set in enumerate(detections):
+                if not isinstance(detection_set, np.ndarray) or detection_set.size == 0:
                     logger.debug(
-                        f"[process_detections] Detection in set {i} is empty, skipping."
-                    )
-                    continue
-
-                ymin, xmin, ymax, xmax = detection[:4]
-                score = np.clip(detection[4], 0, 1)  # Use np.clip for clarity
-
-                if score < threshold:
-                    logger.debug(
-                        f"[process_detections] Detection in set {i} has a score {score} below threshold {threshold}. Skipping."
+                        f"[process_detections] Detection set {i} is empty or not an array, skipping."
                     )
                     continue
 
                 logger.debug(
-                    f"[process_detections] Adding detection with coordinates: ({xmin}, {ymin}), ({xmax}, {ymax}) and score: {score}"
+                    f"[process_detections] Detection set {i} shape: {detection_set.shape}"
                 )
-                boxes.append([ymin, xmin, ymax, xmax])
-                scores.append(score)
-                classes.append(i)
-                num_detections += 1
+                
+                # print(detection_set.shape)
+                for detection in detection_set:
+                    if detection.shape[0] == 0:
+                        logger.debug(
+                            f"[process_detections] Detection in set {i} is empty, skipping."
+                        )
+                        continue
 
+                    ymin, xmin, ymax, xmax = detection[:4]
+                    score = np.clip(detection[4], 0, 1)  # Use np.clip for clarity
+
+                    if score < threshold:
+                        logger.debug(
+                            f"[process_detections] Detection in set {i} has a score {score} below threshold {threshold}. Skipping."
+                        )
+                        continue
+
+                    logger.debug(
+                        f"[process_detections] Adding detection with coordinates: ({xmin}, {ymin}), ({xmax}, {ymax}) and score: {score}"
+                    )
+                    boxes.append([ymin, xmin, ymax, xmax])
+                    scores.append(score)
+                    classes.append(i)
+                    num_detections += 1
+            batch_classes.append(classes)
+            batch_boxes.append(boxes)
+            batch_scores.append(scores)
         logger.debug(
             f"[process_detections] Boxes: {boxes}, Scores: {scores}, Classes: {classes}, Num detections: {num_detections}"
         )
 
+        max_len = max(len(x) for x in batch_classes)
+        new_batch_classes = [bc+[np.nan]*(max_len-len(bc)) for bc in batch_classes]
+        new_batch_scores = [bs+[np.nan]*(max_len-len(bs)) for bs in batch_scores]
+        new_batch_boxes = [[b+self.input_regions[idx] for b in bs]+[[np.nan,np.nan,np.nan,np.nan]+self.input_regions[idx]]*(max_len-len(bs))  for idx,bs in enumerate(batch_boxes)]
         if num_detections == 0:
             logger.debug("[process_detections] No valid detections found.")
-            return np.zeros((20, 6), np.float32)
-
-        combined = np.hstack(
+            return np.full((len(self.input_regions),20, 10),np.nan, np.float32)
+        combined = np.concatenate(
             (
-                np.array(classes)[:, np.newaxis],
-                np.array(scores)[:, np.newaxis],
-                np.array(boxes),
-            )
+                np.array(new_batch_classes)[:,:, np.newaxis],
+                np.array(new_batch_scores)[:,:, np.newaxis],
+                np.array(new_batch_boxes),
+            ),axis=-1
         )
-
-        if combined.shape[0] < 20:
+        if combined.shape[1] < 20:
             padding = np.zeros(
-                (20 - combined.shape[0], combined.shape[1]), dtype=combined.dtype
+                (combined.shape[0],20 - combined.shape[1], combined.shape[-1]), dtype=combined.dtype
             )
-            combined = np.vstack((combined, padding))
+            combined = np.concatenate((combined, padding),axis=1)
 
         logger.debug(
             f"[process_detections] Combined detections (padded to 20 if necessary): {np.array_str(combined, precision=4, suppress_small=True)}"
         )
-
-        return combined[:20, :6]
+        return combined[:,:20, :10]
