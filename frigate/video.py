@@ -439,7 +439,11 @@ def track_camera(
     object_filters = config.objects.filters
 
     motion_detector = ImprovedMotionDetector(
-        frame_shape, config.motion, config.detect.fps, name=config.name
+        frame_shape,
+        config.motion,
+        config.detect.fps,
+        name=config.name,
+        ptz_metrics=ptz_metrics,
     )
     object_detector = RemoteObjectDetector(
         name,
@@ -519,11 +523,9 @@ def detect(
             x_max = int(min(detect_config.width - 1, (box[3] * size) + region[0]))
             y_max = int(min(detect_config.height - 1, (box[2] * size) + region[1]))
 
-            # ignore objects that were detected outside the frame
-            if (x_min >= detect_config.width - 1) or (
-                y_min >= detect_config.height - 1
-            ):
-                continue
+        # ignore objects that were detected outside the frame
+        if (x_min >= detect_config.width - 1) or (y_min >= detect_config.height - 1):
+            continue
 
             width = x_max - x_min
             height = y_max - y_min
@@ -566,7 +568,7 @@ def process_frames(
     exit_on_empty: bool = False,
 ):
     next_region_update = get_tomorrow_at_time(2)
-    config_subscriber = ConfigSubscriber(f"config/detect/{camera_name}")
+    config_subscriber = ConfigSubscriber(f"config/detect/{camera_name}", True)
 
     fps_tracker = EventsPerSecond()
     fps_tracker.start()
