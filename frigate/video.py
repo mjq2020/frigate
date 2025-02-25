@@ -120,12 +120,12 @@ def capture_frames(
         frame_buffer = frame_manager.write(frame_name)
         try:
             frame_buffer[:] = ffmpeg_process.stdout.read(frame_size)
-        except Exception:
+        except Exception as e:
             # shutdown has been initiated
             if stop_event.is_set():
                 break
 
-            logger.error(f"{config.name}: Unable to read frames from ffmpeg process.")
+            logger.error(f"{config.name}: {e} Unable to read frames from ffmpeg process.")
 
             if ffmpeg_process.poll() is not None:
                 logger.error(
@@ -523,9 +523,9 @@ def detect(
             x_max = int(min(detect_config.width - 1, (box[3] * size) + region[0]))
             y_max = int(min(detect_config.height - 1, (box[2] * size) + region[1]))
 
-        # ignore objects that were detected outside the frame
-        if (x_min >= detect_config.width - 1) or (y_min >= detect_config.height - 1):
-            continue
+            # ignore objects that were detected outside the frame
+            if (x_min >= detect_config.width - 1) or (y_min >= detect_config.height - 1):
+                continue
 
             width = x_max - x_min
             height = y_max - y_min

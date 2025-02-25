@@ -57,7 +57,7 @@ class HailoDetector(DetectionApi):
         self.h8l_tensor_format = detector_config.model.input_tensor
         self.h8l_pixel_format = detector_config.model.input_pixel_format
         self.model_url = "https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.11.0/hailo8l/ssd_mobilenet_v1.hef"
-        self.cache_dir = "/config/model_cache/h8l_cache"
+        self.cache_dir = "/tmp/model_cache/h8l_cache"
         self.expected_model_filename = "ssd_mobilenet_v1.hef"
         output_type = "FLOAT32"
 
@@ -71,6 +71,7 @@ class HailoDetector(DetectionApi):
             # Initialize the Hailo device
             self.target = VDevice()
             # Load the HEF (Hailo's binary format for neural networks)
+            print("="*10,self.h8l_model_path)
             self.hef = HEF(self.h8l_model_path)
             # Create configuration parameters from the HEF
             self.configure_params = ConfigureParams.create_from_hef(
@@ -94,16 +95,6 @@ class HailoDetector(DetectionApi):
             self.input_vstream_info = self.hef.get_input_vstream_infos()
             self.output_vstream_info = self.hef.get_output_vstream_infos()
 
-            self.infer = InferVStreams(
-                self.network_group,
-                self.input_vstream_params,
-                self.output_vstream_params,
-            )
-
-            self.activater = self.network_group.activate(self.network_group_params)
-
-            self.__enter__()
-
             logger.info("Hailo device initialized successfully")
             logger.debug(f"[__init__] Model Path: {self.h8l_model_path}")
             logger.debug(f"[__init__] Input Tensor Format: {self.h8l_tensor_format}")
@@ -118,20 +109,6 @@ class HailoDetector(DetectionApi):
         except Exception as e:
             logger.error(f"Failed to initialize Hailo device: {e}")
             raise
-
-    def __enter__(self):
-        logger.debug("[__enter__] Entering function")
-        self.infer_ctx = self.infer.__enter__()
-        self.activater.__enter__()
-        return self.infer_ctx
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # Release the inference context
-        self.infer_ctx.__exit__(exc_type, exc_val, exc_tb)
-        # Release the activator context
-        self.activater.__exit__(exc_type, exc_val, exc_tb)
-        # Indicate that exceptions should be propagated up the stack
-        return False
 
     def check_and_prepare_model(self):
         # Ensure cache directory exists
@@ -173,10 +150,17 @@ class HailoDetector(DetectionApi):
         # logger.debug(
         #     f"[detect_raw] Input data for inference shape: {tensor_input.shape}, dtype: {tensor_input.dtype}"
         # )
-        input_keys = []
-        self.input_regions = []
-        try:
+
+        # try:
+        input_keys=[]
+        self.input_regions=[]
+        with InferVStreams(
+            self.network_group,
+            self.input_vstream_params,
+            self.output_vstream_params,
+        ) as infer_pipeline:
             input_dict = {}
+            
             if isinstance(input_data, dict):
                 input_tmp=[]
                 for k,v in input_data.items():
@@ -185,7 +169,9 @@ class HailoDetector(DetectionApi):
                     for vs in v:
                         self.input_regions.append(list(vs[0,:4,0]))
                 
-                input_dict[self.input_vstream_info[0].name] = np.concatenate(input_tmp,axis=0)
+                input_dict[self.input_vstream_info[0].name] = np.ascontiguousarray(np.concatenate(input_tmp,axis=0))
+
+                
                 logger.debug("[detect_raw] it a dictionary.")
             elif isinstance(input_data, (list, tuple)):
                 for idx, layer_info in enumerate(self.input_vstream_info):
@@ -200,46 +186,57 @@ class HailoDetector(DetectionApi):
             logger.debug(
                 f"[detect_raw] Input dictionary for inference keys: {input_dict.keys()}"
             )
-            # inference
-            raw_output = self.infer_ctx.infer(input_dict)
-            logger.debug(f"[detect_raw] Raw inference output: {raw_output}")
 
-            if self.output_vstream_info[0].name not in raw_output:
-                logger.error(
-                    f"[detect_raw] Missing output stream {self.output_vstream_info[0].name} in inference results"
-                )
-                return np.zeros((20, 6), np.float32)
-
-            raw_output = raw_output[self.output_vstream_info[0].name][0]
-            logger.debug(
-                f"[detect_raw] Raw output for stream {self.output_vstream_info[0].name}: {raw_output}"
-            )
-
-            # Process the raw output
-            detections = self.process_detections(raw_output)
-            if len(detections) == 0:
-                logger.debug(
-                    "[detect_raw] No detections found after processing. Setting default values."
-                )
-                return np.zeros((detections.shape[0], 20, 6), np.float32)
-            else:
-                formatted_detections = detections
-                if (
-                    formatted_detections.shape[1] != 10
-                ):  # Ensure the formatted detections have 6 columns
+            with self.network_group.activate(self.network_group_params):
+                raw_output = infer_pipeline.infer(input_dict)
+                logger.debug(f"[detect_raw] Raw inference output: {raw_output}")
+                # for k,v in raw_output.items():
+                #     print(k,len(v),len(v[0]),len(v[0][0]))
+                if self.output_vstream_info[0].name not in raw_output:
                     logger.error(
-                        f"[detect_raw] Unexpected shape for formatted detections: {formatted_detections.shape}. Expected (20, 6)."
+                        f"[detect_raw] Missing output stream {self.output_vstream_info[0].name} in inference results"
                     )
-                    return np.zeros((detections.shape[0], 20, 6), np.float32)
-                return formatted_detections
-        except HailoRTException as e:
-            logger.error(f"[detect_raw] HailoRTException during inference: {e}")
-            return np.zeros((detections.shape[0], 20, 6), np.float32)
-        except Exception as e:
-            logger.error(f"[detect_raw] Exception during inference: {e}")
-            return np.zeros((detections.shape[0], 20, 6), np.float32)
-        finally:
-            logger.debug("[detect_raw] Exiting function")
+                    return np.zeros((20, 6), np.float32)
+
+                raw_output = raw_output[self.output_vstream_info[0].name]
+                logger.debug(
+                    f"[detect_raw] Raw output for stream {self.output_vstream_info[0].name}: {raw_output}"
+                )
+
+        # Process the raw output
+        detections = self.process_detections(raw_output)
+
+        if detections.shape[1] == 0:
+            logger.debug(
+                "[detect_raw] No detections found after processing. Setting default values."
+            )
+            return np.zeros((detections.shape[0],20, 6), np.float32)
+        else:
+            formatted_detections = detections
+            # print("shape",formatted_detections.shape)
+            if (
+                formatted_detections.shape[-1] != 10
+            ):  # Ensure the formatted detections have 6 columns
+                logger.error(
+                    f"[detect_raw] Unexpected shape for formatted detections: {formatted_detections.shape}. Expected (20, 6)."
+                )
+                return np.zeros((formatted_detections.shape[0],20, 10), np.float32)
+            if len(input_keys):
+                formatted_detections_dict={}
+                input_len = len(input_keys)
+                interval = formatted_detections.shape[0]//input_len
+                for idx,k in enumerate(input_keys):
+                    formatted_detections_dict[k]=formatted_detections[idx*interval:(idx+1)*interval]
+                return formatted_detections_dict 
+            return formatted_detections
+        # except HailoRTException as e:
+        #     logger.error(f"[detect_raw] HailoRTException during inference: {e}")
+        #     return np.zeros((20, 6), np.float32)
+        # except Exception as e:
+        #     logger.error(f"[detect_raw] Exception during inference: {e}")
+        #     return np.zeros((20, 6), np.float32)
+        # finally:
+        #     logger.debug("[detect_raw] Exiting function")
 
     def process_detections(self, raw_detections, threshold=0.5):
         num_detections = 0
