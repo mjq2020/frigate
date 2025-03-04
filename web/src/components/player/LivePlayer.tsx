@@ -47,6 +47,19 @@ type LivePlayerProps = {
   onResetLiveMode?: () => void;
 };
 
+type DetectionResult = {
+  topic: string;
+  payload: {
+    id: string;
+    fps?: number;
+    label: string;
+    score: number;
+    box: [number, number, number, number]; // [x1, y1, x2, y2]
+    area: number;
+    current_zones: string[];
+  }[];
+};
+
 export default function LivePlayer({
   cameraRef = undefined,
   containerRef,
@@ -190,6 +203,118 @@ export default function LivePlayer({
   const playerIsPlaying = useCallback(() => {
     setLiveReady(true);
   }, []);
+
+  // Add a canvas reference
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const [detectionData, setDetectionData] = useState<DetectionResult | null>(null);
+  
+  useEffect(() => {
+    if (!cameraConfig) return;
+    
+    const ws = new WebSocket(`${baseUrl.replace(/^http/, "ws").replace("5000", "5003")}ws`);
+    wsRef.current = ws;
+    
+    ws.onopen = () => {
+      console.log('WebSocket Connection established');
+    };
+    
+    // Processing of received messages
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as DetectionResult;
+        
+        // Check if it is data from the current camera
+        if (data.topic.includes(cameraConfig.name)) {
+          setDetectionData(data);
+        }
+      } catch (error) {
+        console.error('Error parsing webSocket data', error);
+      }
+    };
+    
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+    
+
+    ws.onclose = () => {
+      console.log('WebSocket connection closed');
+    };
+    
+
+    return () => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+    };
+  }, [cameraConfig]);
+
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Clear canvas
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    // If there is detection data, draw detection box and label
+    if (detectionData && detectionData.payload) {
+
+      detectionData.payload.forEach(detection => {
+        if (detection.score<0.1) return;
+        const [x1, y1, x2, y2] = detection.box;
+        const width = x2 - x1;
+        const height = y2 - y1;
+        
+        // Draw detection box
+        ctx.strokeStyle = 'red';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x1, y1, width, height);
+        
+        // Prepare label text (including confidence)
+        const scorePercent = Math.round(detection.score * 100);
+        const labelText = `${detection.label} ${scorePercent}%`;
+        
+        // Set font to measure text width
+        ctx.font = '14px Arial';
+        const textMetrics = ctx.measureText(labelText);
+        const textWidth = textMetrics.width;
+        const textHeight = 20; // Estimate text height
+        
+        // Draw label background
+        ctx.fillStyle = 'rgba(255, 0, 0, 0.7)';
+        ctx.fillRect(x1, y1 - textHeight, textWidth + 10, textHeight);
+        
+        // Draw label text
+        ctx.fillStyle = 'white';
+        ctx.fillText(labelText, x1 + 5, y1 - 5);
+      });
+      
+      // Draw FPS information - upper right corner, green font
+      if (detectionData.payload.length > 0){
+      if ( detectionData.payload[0].fps !== undefined) {
+        const fpsText = `FPS: ${detectionData.payload[0].fps.toFixed(1)}`;
+        ctx.font = '16px Arial';
+        const textMetrics = ctx.measureText(fpsText);
+        const textWidth = textMetrics.width;
+        
+        // Draw background - upper right corner
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+        ctx.fillRect(canvas.width - textWidth - 20, 10, textWidth + 10, 30);
+        
+        // Draw text using green font
+        ctx.fillStyle = '#00FF00'; 
+        ctx.fillText(fpsText, canvas.width - textWidth - 15, 30);
+      }
+    }
+    }
+  }, [detectionData]);
 
   if (!cameraConfig) {
     return <ActivityIndicator />;
@@ -386,6 +511,15 @@ export default function LivePlayer({
           </Chip>
         )}
       </div>
+
+      {/* Add a canvas layer to draw the detection box */}
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 z-30 size-full pointer-events-none"
+        width={cameraConfig.detect.width}
+        height={cameraConfig.detect.height}
+      />
+
       {showStats && (
         <PlayerStats stats={stats} minimal={cameraRef !== undefined} />
       )}
