@@ -11,7 +11,7 @@ class DetectionResult:
     RESULT_DIM = 10
 
     def get_buffer_size(self):
-        return self.MAX_OBJECTS * 4 * self.RESULT_DIM * np.dtype("float32").itemsize
+        return self.MAX_OBJECTS * 3 * self.RESULT_DIM * np.dtype("float32").itemsize
 
 
 class MultiCameraBuffer:
@@ -21,7 +21,7 @@ class MultiCameraBuffer:
         frame_width: int,
         frame_height: int,
         frame_buffer_size: int = 3,
-        batch=4,
+        batch=3,
     ):
         self.camera_ids = camera_ids
         self.num_cameras = len(camera_ids)

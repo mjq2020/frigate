@@ -36,9 +36,12 @@ class WebSocket(WebSocket_):
 class WebSocketClient(Communicator):  # type: ignore[misc]
     """Frigate wrapper for ws client."""
 
-    def __init__(self, config: FrigateConfig) -> None:
+    def __init__(self, config: FrigateConfig,detect_socket:bool=False) -> None:
         self.config = config
         self.websocket_server = None
+        self.detect_socket = detect_socket
+        if detect_socket:
+            self.start()
 
     def subscribe(self, receiver: Callable) -> None:
         self._dispatcher = receiver
@@ -46,39 +49,40 @@ class WebSocketClient(Communicator):  # type: ignore[misc]
 
     def start(self) -> None:
         """Start the websocket client."""
+        if not self.detect_socket:
+            class _WebSocketHandler(WebSocket):  # type: ignore[misc]
+                receiver = self._dispatcher
 
-        class _WebSocketHandler(WebSocket):  # type: ignore[misc]
-            receiver = self._dispatcher
+                def received_message(self, message: WebSocket.received_message) -> None:
+                    try:
+                        json_message = json.loads(message.data.decode("utf-8"))
+                        json_message = {
+                            "topic": json_message.get("topic"),
+                            "payload": json_message.get("payload"),
+                        }
+                    except Exception:
+                        logger.warning(
+                            f"Unable to parse websocket message as valid json: {message.data.decode('utf-8')}"
+                        )
+                        return
 
-            def received_message(self, message: WebSocket.received_message) -> None:
-                try:
-                    json_message = json.loads(message.data.decode("utf-8"))
-                    json_message = {
-                        "topic": json_message.get("topic"),
-                        "payload": json_message.get("payload"),
-                    }
-                except Exception:
-                    logger.warning(
-                        f"Unable to parse websocket message as valid json: {message.data.decode('utf-8')}"
+                    logger.debug(
+                        f"Publishing mqtt message from websockets at {json_message['topic']}."
                     )
-                    return
+                    self.receiver(
+                        json_message["topic"],
+                        json_message["payload"],
+                    )
 
-                logger.debug(
-                    f"Publishing mqtt message from websockets at {json_message['topic']}."
-                )
-                self.receiver(
-                    json_message["topic"],
-                    json_message["payload"],
-                )
-
-        # start a websocket server on 5002
+        # start a websocket server on 5002http://wstool.jackxiang.com/ https://wstool.js.org/
         WebSocketWSGIHandler.http_version = "1.1"
+
         self.websocket_server = make_server(
-            "127.0.0.1",
-            5002,
+            "0.0.0.0" if self.detect_socket else "127.0.0.1",
+            5003 if self.detect_socket else 5002 ,
             server_class=WSGIServer,
             handler_class=WebSocketWSGIRequestHandler,
-            app=WebSocketWSGIApplication(handler_cls=_WebSocketHandler),
+            app=WebSocketWSGIApplication(handler_cls= WebSocket if self.detect_socket else _WebSocketHandler),
         )
         self.websocket_server.initialize_websockets_manager()
         self.websocket_thread = threading.Thread(
@@ -86,7 +90,7 @@ class WebSocketClient(Communicator):  # type: ignore[misc]
         )
         self.websocket_thread.start()
 
-    def publish(self, topic: str, payload: str, _: bool) -> None:
+    def publish(self, topic: str, payload: str, _: bool=True) -> None:
         try:
             ws_message = json.dumps(
                 {
@@ -109,9 +113,10 @@ class WebSocketClient(Communicator):  # type: ignore[misc]
             pass
 
     def stop(self) -> None:
-        self.websocket_server.manager.close_all()
-        self.websocket_server.manager.stop()
-        self.websocket_server.manager.join()
-        self.websocket_server.shutdown()
-        self.websocket_thread.join()
+        if self.websocket_server:
+            self.websocket_server.manager.close_all()
+            self.websocket_server.manager.stop()
+            self.websocket_server.manager.join()
+            self.websocket_server.shutdown()
+            self.websocket_thread.join()
         logger.info("Exiting websocket client...")

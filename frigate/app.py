@@ -7,6 +7,7 @@ import shutil
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Optional
+import threading
 
 import psutil
 import uvicorn
@@ -102,6 +103,7 @@ class FrigateApp:
         self.region_grids: dict[str, list[list[dict[str, int]]]] = {}
         self.frame_manager = SharedMemoryFrameManager()
         self.config = config
+        self.ws_server = None
 
     def ensure_dirs(self) -> None:
         dirs = [
@@ -327,6 +329,9 @@ class FrigateApp:
         if notification_cameras:
             comms.append(WebPushClient(self.config, self.stop_event))
 
+        # Initialize WebSocketClient
+        self.ws_server = WebSocketClient(self.config,detect_socket=True)
+        
         comms.append(WebSocketClient(self.config))
         comms.append(self.inter_process_communicator)
 
@@ -619,6 +624,67 @@ class FrigateApp:
                 logger.info(f"***    Password: {password}   ***")
                 logger.info("********************************************************")
                 logger.info("********************************************************")
+    def publish_detection_results(self):
+        """Publish test results to WebSocket client"""
+        try:
+            results = {}
+            # Publish detection results to WebSocket client
+            if hasattr(self, 'detected_frames_processor') and self.detected_frames_processor is not None:
+                camera_states = self.detected_frames_processor.camera_states
+                
+                for camera_name, camera_state in camera_states.items():
+                    # Check whether the camera is enabled
+                    if not self.config.cameras.get(camera_name, {}).enabled:
+                        continue
+                        
+                    # Get the current detection result
+                    current_detections = []
+                    if hasattr(camera_state, 'tracked_objects') and camera_state.tracked_objects is not None:
+                        # Get all current detection objects from tracked_objects dictionary
+                        for obj_id, obj in camera_state.tracked_objects.items():
+                            # Do not check required_zones attribute, add all detection objects directly
+                            try:
+                                detection = {
+                                    "id": obj.obj_data['id'],
+                                    "label": obj.obj_data['label'],
+                                    "score": float(obj.computed_score),
+                                    "fps":camera_state.fps,
+                                    "box": [
+                                        float(obj.obj_data['box'][0]),
+                                        float(obj.obj_data['box'][1]),
+                                        float(obj.obj_data['box'][2]),
+                                        float(obj.obj_data['box'][3])
+                                    ],
+                                    "area": int(obj.obj_data['area']),
+                                    "current_zones": list(obj.current_zones) if obj.current_zones else []
+                                }
+                                current_detections.append(detection)
+                            except Exception as e:
+                                logger.error(f"Error in processing detection object: {str(e)}")
+                                continue
+                    
+                    results[camera_name] = current_detections
+            else:
+                logger.warning("TrackedObjectProcessor is unavailable, unable to get detection results")
+            
+            # Send detection results of each camera to separate topics
+            if self.ws_server is not None:
+                for camera_name, detections in results.items():
+                    try:
+                        topic = f"{camera_name}/detection_results"
+                        # Pass detections object directly, avoid serialization here
+                        logger.debug(f"Publish detection results to {topic}: {len(detections)} objects")
+                        self.ws_server.publish(topic, detections)
+                    except Exception as e:
+                        logger.error(f"Error publishing detection results for {camera_name}: {str(e)}")
+            else:
+                logger.warning("WebSocket server is not initialized, unable to publish detection results")
+        except Exception as e:
+            logger.error(f"Error publishing detection results: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        threading.Timer(0.03, self.publish_detection_results).start()
 
     def start(self) -> None:
         logger.info(f"Starting Frigate ({VERSION})")
@@ -661,6 +727,10 @@ class FrigateApp:
         self.init_auth()
 
         try:
+            # Starting detection result publishing
+            threading.Timer(0.5, self.publish_detection_results).start()
+            logger.info("detection result publishing service has started")
+            
             uvicorn.run(
                 create_fastapi_app(
                     self.config,

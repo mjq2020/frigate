@@ -135,7 +135,7 @@ def run_detector(
         input_tensor_dict = carmerabuffer.read_frames()
         
         if not input_tensor_dict:
-            time.sleep(0.06)
+            time.sleep(0.003)
             continue
 
         # detect and send the output
@@ -255,7 +255,7 @@ class RemoteObjectDetector:
 
                     detections_ls.append(detections)
                 break
-            time.sleep(0.02)
+            time.sleep(0.003)
         self.fps.update()
 
         return detections_ls

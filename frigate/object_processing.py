@@ -2,6 +2,7 @@ import datetime
 import json
 import logging
 import queue
+import time
 import threading
 from collections import defaultdict
 from multiprocessing.synchronize import Event as MpEvent
@@ -61,6 +62,7 @@ class CameraState:
         self.previous_frame_id = None
         self.callbacks = defaultdict(list)
         self.ptz_autotracker_thread = ptz_autotracker_thread
+        self.fps = 0
 
     def get_current_frame(self, draw_options={}):
         with self.current_frame_lock:
@@ -244,7 +246,9 @@ class CameraState:
         current_detections: dict[str, dict[str, any]],
         motion_boxes: list[tuple[int, int, int, int]],
         regions: list[tuple[int, int, int, int]],
+        fps:float,
     ):
+        self.fps = fps
         current_frame = self.frame_manager.get(
             frame_name, self.camera_config.frame_shape_yuv
         )
@@ -691,6 +695,7 @@ class TrackedObjectProcessor(threading.Thread):
                     current_tracked_objects,
                     motion_boxes,
                     regions,
+                    fps,
                 ) = self.tracked_objects_queue.get(True, 1)
             except queue.Empty:
                 continue
@@ -698,7 +703,7 @@ class TrackedObjectProcessor(threading.Thread):
             camera_state = self.camera_states[camera]
 
             camera_state.update(
-                frame_name, frame_time, current_tracked_objects, motion_boxes, regions
+                frame_name, frame_time, current_tracked_objects, motion_boxes, regions, fps
             )
 
             self.update_mqtt_motion(camera, frame_time, motion_boxes)
