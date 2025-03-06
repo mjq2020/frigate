@@ -506,6 +506,8 @@ def detect(
     for region in regions:
         tensor_input = create_tensor_input(frame, model_config, region)
         input_tensor_ls.append(tensor_input)
+    while len(input_tensor_ls)<3:
+        input_tensor_ls.append(np.zeros_like(input_tensor_ls[0],dtype=input_tensor_ls[0].dtype))
 
     regions_detections = object_detector.detect(np.concatenate(input_tensor_ls, 0))
     detections_ls = []
@@ -728,7 +730,7 @@ def process_frames(
                 object_detector,
                 frame,
                 model_config,
-                regions[:4],
+                regions[:3],
                 objects_to_track,
                 object_filters,
             ):
@@ -859,7 +861,7 @@ def process_frames(
             )
         # add to the queue if not full
         if detected_objects_queue.full():
-            # frame_manager.close(frame_name)
+            frame_manager.close(frame_name)
             continue
         else:
             fps_tracker.update()
@@ -872,10 +874,11 @@ def process_frames(
                     detections,
                     motion_boxes,
                     regions,
+                    object_detector.fps.eps()
                 )
             )
             camera_metrics.detection_fps.value = object_detector.fps.eps()
-            # frame_manager.close(frame_name)
+            frame_manager.close(frame_name)
     motion_detector.stop()
     requestor.stop()
     config_subscriber.stop()
